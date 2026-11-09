@@ -1,0 +1,71 @@
+name: Build Hero TV APK
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # needed only to attach the finished APK to a Release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack the project zip
+        run: |
+          test -f HeroTV-project.zip || { echo "HeroTV-project.zip is missing from the repository root"; exit 1; }
+          unzip -q HeroTV-project.zip
+          test -f HeroTV/gradlew || { echo "unexpected zip layout"; exit 1; }
+          chmod +x HeroTV/gradlew
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Build debug APK (must succeed)
+        working-directory: HeroTV
+        run: ./gradlew --no-daemon --stacktrace assembleDebug 2>&1 | tee build-debug.log
+
+      - name: Build release APK (smaller; failure here does not stop the debug APK)
+        id: release
+        continue-on-error: true
+        working-directory: HeroTV
+        run: ./gradlew --no-daemon --stacktrace assembleRelease 2>&1 | tee build-release.log
+
+      - name: Verify the APKs
+        working-directory: HeroTV
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          echo "build-tools: $BT"
+          for f in app/build/outputs/apk/debug/*.apk app/build/outputs/apk/release/*.apk; do
+            [ -f "$f" ] || continue
+            echo "=============== $f ($(du -h "$f" | cut -f1))"
+            "$BT/aapt" dump badging "$f" | grep -E "^package:|sdkVersion|launchable-activity|leanback|uses-permission"
+            "$BT/apksigner" verify --print-certs "$f" | head -2 || true
+            # safety: the app must NOT be a HOME/launcher replacement and must have no boot receiver
+            "$BT/aapt" dump xmltree "$f" AndroidManifest.xml > manifest.txt
+            if grep -q "category.HOME" manifest.txt; then echo "FAIL: HOME category present"; exit 1; fi
+            if grep -q "BOOT_COMPLETED" manifest.txt; then echo "FAIL: boot receiver present"; exit 1; fi
+            echo "OK: not a HOME app, no boot receiver"
+          done
+
+      - name: Publish APKs (direct download from the Releases page)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir out
+          cp HeroTV/app/build/outputs/apk/debug/app-debug.apk out/HeroTV-debug.apk
+          [ -f HeroTV/app/build/outputs/apk/release/app-release.apk ] && cp HeroTV/app/build/outputs/apk/release/app-release.apk out/HeroTV-release.apk || echo "no release apk"
+          gh release create "apk-${{ github.run_number }}" out/*.apk \
+            --title "Hero TV APK #${{ github.run_number }}" \
+            --notes "Built by GitHub Actions. Not installed anywhere. Use HeroTV-release.apk, or HeroTV-debug.apk if the release one misbehaves."
+
+      - name: Keep the build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: HeroTV/build-*.log
+          if-no-files-found: ignore
